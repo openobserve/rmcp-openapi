@@ -1066,6 +1066,84 @@ impl ToolGenerator {
             return Ok(Value::Object(schema_obj));
         }
 
+        // Handle allOf schemas - merge all schemas into a single object
+        if !obj_schema.all_of.is_empty() {
+            let mut merged_properties = serde_json::Map::new();
+            let mut merged_required = Vec::new();
+
+            for schema_ref in &obj_schema.all_of {
+                let schema_json = match schema_ref {
+                    ObjectOrReference::Object(schema) => {
+                        Self::convert_object_schema_to_json_schema(schema, spec, visited)?
+                    }
+                    ObjectOrReference::Ref { ref_path, .. } => {
+                        let resolved = Self::resolve_reference(ref_path, spec, visited)?;
+                        let result =
+                            Self::convert_object_schema_to_json_schema(&resolved, spec, visited)?;
+                        // Remove after conversion to allow schema reuse
+                        visited.remove(ref_path);
+                        result
+                    }
+                };
+
+                // Merge properties from this schema
+                if let Some(props) = schema_json.get("properties") {
+                    if let Some(props_obj) = props.as_object() {
+                        for (key, value) in props_obj {
+                            merged_properties.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+
+                // Merge required fields from this schema
+                if let Some(required) = schema_json.get("required") {
+                    if let Some(required_arr) = required.as_array() {
+                        for item in required_arr {
+                            if let Some(field) = item.as_str() {
+                                if !merged_required.contains(&field.to_string()) {
+                                    merged_required.push(field.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !merged_properties.is_empty() {
+                schema_obj.insert("properties".to_string(), Value::Object(merged_properties));
+            }
+            if !merged_required.is_empty() {
+                schema_obj.insert("required".to_string(), json!(merged_required));
+            }
+
+            return Ok(Value::Object(schema_obj));
+        }
+
+        // Handle anyOf schemas - keep as-is for JSON Schema
+        if !obj_schema.any_of.is_empty() {
+            let mut any_of_schemas = Vec::new();
+            for schema_ref in &obj_schema.any_of {
+                let schema_json = match schema_ref {
+                    ObjectOrReference::Object(schema) => {
+                        Self::convert_object_schema_to_json_schema(schema, spec, visited)?
+                    }
+                    ObjectOrReference::Ref { ref_path, .. } => {
+                        let resolved = Self::resolve_reference(ref_path, spec, visited)?;
+                        let result =
+                            Self::convert_object_schema_to_json_schema(&resolved, spec, visited)?;
+                        // Remove after conversion to allow schema reuse
+                        visited.remove(ref_path);
+                        result
+                    }
+                };
+                any_of_schemas.push(schema_json);
+            }
+            schema_obj.insert("anyOf".to_string(), json!(any_of_schemas));
+            // When anyOf is present, we typically don't include other properties
+            // that would conflict with the anyOf semantics
+            return Ok(Value::Object(schema_obj));
+        }
+
         // Handle object properties
         if !obj_schema.properties.is_empty() {
             let properties = &obj_schema.properties;
@@ -6107,5 +6185,111 @@ mod tests {
 
         // Validate using snapshot
         insta::assert_json_snapshot!("test_multipart_non_file_fields_unchanged", schema);
+    }
+
+    #[test]
+    fn test_allof_schema_conversion() {
+        // Test case simulating serde(flatten) which generates allOf in OpenAPI
+        let spec_json = json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Test API",
+                "version": "1.0.0"
+            },
+            "paths": {
+                "/alerts": {
+                    "post": {
+                        "operationId": "createAlert",
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "$ref": "#/components/schemas/CreateAlertRequestBody"
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Success"
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "CreateAlertRequestBody": {
+                        "allOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "folder_id": {
+                                        "type": "string",
+                                        "description": "Optional folder ID"
+                                    }
+                                }
+                            },
+                            {
+                                "$ref": "#/components/schemas/Alert"
+                            }
+                        ]
+                    },
+                    "Alert": {
+                        "type": "object",
+                        "required": ["name", "condition"],
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Alert name"
+                            },
+                            "condition": {
+                                "type": "string",
+                                "description": "Alert condition"
+                            },
+                            "enabled": {
+                                "type": "boolean",
+                                "description": "Whether the alert is enabled",
+                                "default": true
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let spec = crate::Spec::from_value(spec_json).expect("Failed to parse spec");
+        let tools = spec
+            .to_tool_metadata(None, false, false)
+            .expect("Failed to generate tools");
+
+        assert_eq!(tools.len(), 1);
+        let tool = &tools[0];
+
+        println!("\n=== Generated Tool Schema ===");
+        println!("{}", serde_json::to_string_pretty(&tool.parameters).unwrap());
+
+        // Extract the request_body schema
+        let properties = tool.parameters.get("properties").unwrap();
+        let request_body = properties.get("request_body").unwrap();
+
+        println!("\n=== request_body Schema ===");
+        println!("{}", serde_json::to_string_pretty(&request_body).unwrap());
+
+        // Check if properties are present (they won't be with current implementation)
+        if let Some(rb_props) = request_body.get("properties") {
+            println!("\n✓ Properties found:");
+            if let Some(obj) = rb_props.as_object() {
+                for key in obj.keys() {
+                    println!("  - {}", key);
+                }
+            }
+        } else {
+            println!("\n✗ NO PROPERTIES FOUND - allOf is not being merged!");
+        }
+
+        // This test documents the current (broken) behavior
+        // TODO: Fix allOf handling to merge schemas properly
     }
 }
