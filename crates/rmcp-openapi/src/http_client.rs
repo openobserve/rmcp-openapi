@@ -162,6 +162,20 @@ impl HttpClient {
         }
     }
 
+    /// Create a new HTTP client from a caller-supplied `reqwest::Client`
+    ///
+    /// Lets the caller own the transport configuration — TLS in particular, which
+    /// `new` and `with_timeout` cannot express. The client is used as given: any
+    /// user agent, timeout or TLS setting must already be applied to it.
+    #[must_use]
+    pub fn with_client(client: Client) -> Self {
+        Self {
+            client,
+            base_url: None,
+            default_headers: HeaderMap::new(),
+        }
+    }
+
     /// Set the base URL for all requests
     ///
     /// # Errors

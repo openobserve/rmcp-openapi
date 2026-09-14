@@ -540,3 +540,43 @@ impl MockPetstoreServer {
             .create()
     }
 }
+
+/// A client passed to `with_client` must be used as given. Proven through a user
+/// agent none of the other constructors would produce: the mock only answers when
+/// that exact header reaches it.
+#[actix_web::test]
+async fn test_with_client_uses_the_supplied_client() -> anyhow::Result<()> {
+    let mut mock_server = mockito::Server::new_async().await;
+    let mock = mock_server
+        .mock("GET", "/ping")
+        .match_header("user-agent", "caller-supplied/9.9")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let supplied = reqwest::Client::builder()
+        .user_agent("caller-supplied/9.9")
+        .build()?;
+    let client =
+        HttpClient::with_client(supplied).with_base_url(Url::parse(&mock_server.url())?)?;
+
+    let tool_metadata = rmcp_openapi::ToolMetadata {
+        name: "ping".to_string(),
+        title: None,
+        description: None,
+        parameters: json!({"type": "object", "properties": {}}),
+        output_schema: None,
+        method: "GET".to_string(),
+        path: "/ping".to_string(),
+        security: None,
+        parameter_mappings: std::collections::HashMap::new(),
+    };
+
+    let response = client.execute_tool_call(&tool_metadata, &json!({})).await?;
+
+    assert!(response.is_success);
+    mock.assert_async().await;
+    Ok(())
+}
